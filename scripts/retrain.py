@@ -103,6 +103,7 @@ import random
 import re
 import sys
 import tarfile
+import math
 
 import numpy as np
 from six.moves import urllib
@@ -606,7 +607,7 @@ def get_random_distorted_bottlenecks(
 
 
 def should_distort_images(flip_left_right, random_crop, random_scale,
-                          random_brightness):
+                          random_brightness, random_rotate):
   """Whether any distortions are enabled, from the input flags.
 
   Args:
@@ -620,11 +621,12 @@ def should_distort_images(flip_left_right, random_crop, random_scale,
     Boolean value indicating whether any distortions should be applied.
   """
   return (flip_left_right or (random_crop != 0) or (random_scale != 0) or
-          (random_brightness != 0))
+          (random_brightness != 0) or (random_rotate != 0))
 
 
 def add_input_distortions(flip_left_right, random_crop, random_scale,
-                          random_brightness, input_width, input_height,
+                          random_brightness, random_rotate,
+                          input_width, input_height,
                           input_depth, input_mean, input_std):
   """Creates the operations to apply the specified distortions.
 
@@ -707,12 +709,25 @@ def add_input_distortions(flip_left_right, random_crop, random_scale,
     flipped_image = tf.image.random_flip_left_right(cropped_image)
   else:
     flipped_image = cropped_image
+
+  if random_rotate != 0:
+    roate_min = -random_rotate * math.pi / 180
+    roate_min = random_rotate * math.pi / 180
+    roate_value = tf.random_uniform(tensor_shape.scalar(),
+                                    minval=roate_min,
+                                    maxval=roate_min)
+    roated_image = tf.contrib.image.rotate(flipped_image,
+                                           roate_value,
+                                           interpolation='BILINEAR')
+  else:
+    roated_image = flipped_image
+
   brightness_min = 1.0 - (random_brightness / 100.0)
   brightness_max = 1.0 + (random_brightness / 100.0)
   brightness_value = tf.random_uniform(tensor_shape.scalar(),
                                        minval=brightness_min,
                                        maxval=brightness_max)
-  brightened_image = tf.multiply(flipped_image, brightness_value)
+  brightened_image = tf.multiply(roated_image, brightness_value)
   offset_image = tf.subtract(brightened_image, input_mean)
   mul_image = tf.multiply(offset_image, 1.0 / input_std)
   distort_result = tf.expand_dims(mul_image, 0, name='DistortResult')
@@ -766,11 +781,28 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor,
 
   # Organizing the following ops as `final_training_ops` so they're easier
   # to see in TensorBoard
+
+  hidden_layer_size = 512
+  with tf.name_scope('final_training_ops_1'):
+    with tf.name_scope('weights'):
+      initial_value_1 = tf.truncated_normal(
+          [bottleneck_tensor_size, hidden_layer_size], stddev=0.001)
+
+      layer_weights_1 = tf.Variable(initial_value_1, name='final_weights')
+
+      variable_summaries(layer_weights_1)
+    with tf.name_scope('biases'):
+      layer_biases_1 = tf.Variable(tf.zeros([hidden_layer_size]), name='final_biases')
+      variable_summaries(layer_biases_1)
+    with tf.name_scope('Wx_plus_b'):
+      hidden_output = tf.nn.relu(tf.matmul(bottleneck_input, layer_weights_1) + layer_biases_1)
+      tf.summary.histogram('pre_activations', hidden_output)
+
   layer_name = 'final_training_ops'
   with tf.name_scope(layer_name):
     with tf.name_scope('weights'):
       initial_value = tf.truncated_normal(
-          [bottleneck_tensor_size, class_count], stddev=0.001)
+          [hidden_layer_size, class_count], stddev=0.001)
 
       layer_weights = tf.Variable(initial_value, name='final_weights')
 
@@ -779,7 +811,7 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor,
       layer_biases = tf.Variable(tf.zeros([class_count]), name='final_biases')
       variable_summaries(layer_biases)
     with tf.name_scope('Wx_plus_b'):
-      logits = tf.matmul(bottleneck_input, layer_weights) + layer_biases
+      logits = tf.matmul(hidden_output, layer_weights) + layer_biases
       tf.summary.histogram('pre_activations', logits)
 
   final_tensor = tf.nn.softmax(logits, name=final_tensor_name)
@@ -999,7 +1031,7 @@ def main(_):
   # See if the command-line flags mean we're applying any distortions.
   do_distort_images = should_distort_images(
       FLAGS.flip_left_right, FLAGS.random_crop, FLAGS.random_scale,
-      FLAGS.random_brightness)
+      FLAGS.random_brightness, FLAGS.random_rotate)
 
   with tf.Session(graph=graph) as sess:
     # Set up the image decoding sub-graph.
@@ -1013,7 +1045,7 @@ def main(_):
       (distorted_jpeg_data_tensor,
        distorted_image_tensor) = add_input_distortions(
            FLAGS.flip_left_right, FLAGS.random_crop, FLAGS.random_scale,
-           FLAGS.random_brightness, model_info['input_width'],
+           FLAGS.random_brightness, FLAGS.random_rotate, model_info['input_width'],
            model_info['input_height'], model_info['input_depth'],
            model_info['input_mean'], model_info['input_std'])
     else:
@@ -1306,6 +1338,14 @@ if __name__ == '__main__':
       help="""\
       A percentage determining how much to randomly multiply the training image
       input pixels up or down by.\
+      """
+  )
+  parser.add_argument(
+      '--random_rotate',
+      type=int,
+      default=0,
+      help="""\
+      A degree determining how much to randomly rotate the training image by.\
       """
   )
   parser.add_argument(
